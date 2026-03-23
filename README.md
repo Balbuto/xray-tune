@@ -98,7 +98,7 @@ Zero-config запуск
 
 ## 📦 Установка
 ```bash
-git clone https://github.com/your-repo/xray-optimizer.git
+git clone https://github.com/Balbuto/xray-tune.git
 cd xray-optimizer
 chmod +x script.sh
 sudo ./script.sh
