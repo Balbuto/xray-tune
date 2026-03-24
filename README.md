@@ -100,8 +100,8 @@ Zero-config запуск
 ```bash
 git clone https://github.com/Balbuto/xray-tune.git
 cd xray-optimizer
-chmod +x script.sh
-sudo ./script.sh
+chmod +x xray-tune.sh
+sudo ./xray-tune.sh
 ```
 
 ## 📊 Бенчмарки
