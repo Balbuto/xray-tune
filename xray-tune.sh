@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-echo "==== Xray Ultimate Optimizer PRO (0.2beta) ===="
+echo "==== Xray Ultimate Optimizer (0.3-beta) ===="
 
 ### --- ПРОВЕРКА ROOT ---
 if [ "$EUID" -ne 0 ]; then
@@ -14,12 +14,23 @@ fi
 echo "== Установка зависимостей =="
 
 apt update -y
-apt install -y curl jq ufw fail2ban docker.io
+apt install -y curl jq ufw fail2ban ca-certificates gnupg lsb-release
 
-# Установка yq (YAML парсер)
+### --- УСТАНОВКА DOCKER (ОФИЦИАЛЬНЫЙ СПОСОБ) ---
+echo "== Установка Docker =="
+
+curl -fsSL https://get.docker.com -o get-docker.sh
+sh get-docker.sh
+rm -f get-docker.sh
+usermod -aG docker root 2>/dev/null || true
+
+echo "✓ Docker установлен: $(docker --version)"
+
+### --- УСТАНОВКА yq (YAML парсер) ---
 if ! command -v yq &> /dev/null; then
   echo "Устанавливаем yq..."
-  YQ_URL="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+  YQ_VERSION=$(curl -s https://api.github.com/repos/mikefarah/yq/releases/latest | jq -r '.tag_name' 2>/dev/null || echo "v4.40.5")
+  YQ_URL="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
   curl -sL "$YQ_URL" -o /usr/local/bin/yq
   chmod +x /usr/local/bin/yq
 fi
@@ -116,11 +127,6 @@ LOG_PATH_HOST=""
 LOG_PATH_CONTAINER="/var/log/xray/access.log"
 
 if [ "$INSTALL_TYPE" == "2" ]; then
-  if ! command -v docker &> /dev/null; then
-    echo "Docker не установлен!"
-    exit 1
-  fi
-
   echo "== Поиск контейнера =="
 
   CONTAINERS=$(docker ps --format "{{.Names}} {{.Image}}" | grep -Ei "xray|v2ray|x-ui|3x-ui" || true)
@@ -151,7 +157,6 @@ if [ "$INSTALL_TYPE" == "2" ]; then
 
   echo "Контейнер: $DOCKER_CONTAINER"
 
-  # Проверка существования контейнера
   if ! docker inspect "$DOCKER_CONTAINER" &>/dev/null; then
     echo "❌ Контейнер '$DOCKER_CONTAINER' не найден"
     exit 1
@@ -160,7 +165,6 @@ if [ "$INSTALL_TYPE" == "2" ]; then
   ### --- ПОИСК КОНФИГА ВНУТРИ КОНТЕЙНЕРА ---
   echo "== Поиск config.json =="
 
-  # Проверяем несколько возможных путей внутри контейнера
   for cfg_path in /etc/xray/config.json /usr/local/etc/xray/config.json /app/config.json /config/config.json; do
     if docker exec "$DOCKER_CONTAINER" test -f "$cfg_path" 2>/dev/null; then
       CONFIG_PATH_CONTAINER="$cfg_path"
@@ -169,7 +173,6 @@ if [ "$INSTALL_TYPE" == "2" ]; then
     fi
   done
 
-  # Проверяем, смонтирован ли конфиг как volume/bind-mount
   MOUNT_INFO=$(docker inspect "$DOCKER_CONTAINER" --format='{{json .Mounts}}' 2>/dev/null || echo "[]")
   CONFIG_MOUNT=$(echo "$MOUNT_INFO" | jq -r --arg dest "$CONFIG_PATH_CONTAINER" '.[] | select(.Destination == $dest) | .Source' 2>/dev/null || true)
 
@@ -181,7 +184,6 @@ if [ "$INSTALL_TYPE" == "2" ]; then
     CONFIG_PATH_HOST=""
   fi
 
-  # Проверяем логи
   for log_path in /var/log/xray/access.log /tmp/xray/access.log /app/logs/access.log; do
     if docker exec "$DOCKER_CONTAINER" test -f "$log_path" 2>/dev/null; then
       LOG_PATH_CONTAINER="$log_path"
@@ -198,7 +200,6 @@ if [ "$INSTALL_TYPE" == "2" ]; then
   echo "== Поиск docker-compose.yml =="
 
   COMPOSE_FILE=""
-  # Ищем в текущей директории и стандартных путях
   for cf in ./docker-compose.yml ./compose.yml ~/docker-compose.yml /opt/docker-compose.yml; do
     if [ -f "$cf" ]; then
       COMPOSE_FILE="$cf"
@@ -206,7 +207,6 @@ if [ "$INSTALL_TYPE" == "2" ]; then
     fi
   done
 
-  # Если не нашли, спрашиваем у пользователя
   if [ -z "$COMPOSE_FILE" ]; then
     read -p "Путь к docker-compose.yml (или пусто для пропуска): " COMPOSE_FILE
   fi
@@ -218,7 +218,6 @@ if [ "$INSTALL_TYPE" == "2" ]; then
     if [ "$PATCH" == "y" ]; then
       cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak.$(date +%Y%m%d%H%M%S)"
 
-      # Найти сервис с Xray
       SERVICE=$(yq e '.services | keys | .[]' "$COMPOSE_FILE" 2>/dev/null | while read -r s; do
         IMAGE=$(yq e ".services.$s.image" "$COMPOSE_FILE" 2>/dev/null)
         echo "$IMAGE" | grep -qiE "xray|v2ray|x-ui|3x-ui" && echo "$s"
@@ -232,18 +231,12 @@ if [ "$INSTALL_TYPE" == "2" ]; then
       if [ -n "$SERVICE" ]; then
         echo "Сервис: $SERVICE"
 
-        # Добавляем cap_add
         yq e -i ".services.$SERVICE.cap_add += [\"NET_ADMIN\", \"NET_BIND_SERVICE\"]" "$COMPOSE_FILE"
-
-        # Добавляем ulimits
         yq e -i ".services.$SERVICE.ulimits.nofile.soft = 1048576" "$COMPOSE_FILE"
         yq e -i ".services.$SERVICE.ulimits.nofile.hard = 1048576" "$COMPOSE_FILE"
-
-        # Добавляем sysctl для BBR
         yq e -i ".services.$SERVICE.sysctls.\"net.core.somaxconn\" = \"65535\"" "$COMPOSE_FILE"
         yq e -i ".services.$SERVICE.sysctls.\"net.ipv4.tcp_tw_reuse\" = \"1\"" "$COMPOSE_FILE"
 
-        # Проверяем/добавляем volumes для конфига и логов
         if [ -z "$CONFIG_MOUNT" ]; then
           echo "⚠ Добавьте volume для конфига в docker-compose:"
           echo "  volumes:"
@@ -261,11 +254,7 @@ if [ "$INSTALL_TYPE" == "2" ]; then
         DIR=$(dirname "$COMPOSE_FILE")
         cd "$DIR"
 
-        if command -v docker compose &>/dev/null; then
-          docker compose up -d
-        else
-          docker-compose up -d
-        fi
+        docker compose up -d
       else
         echo "❌ Не удалось определить сервис для патчинга"
       fi
@@ -279,7 +268,6 @@ echo "== Подготовка config.json =="
 TEMP_CONFIG="/tmp/xray-config-tune.json"
 
 if [ "$INSTALL_TYPE" == "2" ] && [ -z "$CONFIG_PATH_HOST" ]; then
-  # Копируем конфиг из контейнера
   echo "Копируем конфиг из контейнера..."
   if ! docker cp "$DOCKER_CONTAINER:$CONFIG_PATH_CONTAINER" "$TEMP_CONFIG" 2>/dev/null; then
     echo "❌ Не удалось скопировать конфиг из контейнера"
@@ -290,7 +278,6 @@ if [ "$INSTALL_TYPE" == "2" ] && [ -z "$CONFIG_PATH_HOST" ]; then
 elif [ -n "$CONFIG_PATH_HOST" ]; then
   XRAY_CONFIG="$CONFIG_PATH_HOST"
 else
-  # Host installation или ручной путь
   XRAY_CONFIG=""
   for path in /usr/local/etc/xray/config.json /etc/xray/config.json; do
     [ -f "$path" ] && XRAY_CONFIG="$path"
@@ -306,20 +293,17 @@ else
   fi
 fi
 
-# Валидация JSON
 if ! jq empty "$XRAY_CONFIG" 2>/dev/null; then
   echo "❌ Ошибка в JSON файле: $XRAY_CONFIG"
   exit 1
 fi
 
-### --- ОПРЕДЕЛЕНИЕ ПОРТОВ (ИСПРАВЛЕННЫЙ REGEX) ---
+### --- ОПРЕДЕЛЕНИЕ ПОРТОВ ---
 echo "== Определение портов =="
 
-# Исправленный паттерн: ищем "port": <число>
 DETECTED_PORTS=$(jq -r '.. | objects | .port? // empty' "$XRAY_CONFIG" 2>/dev/null | grep -E '^[0-9]+$' | sort -nu || true)
 
 if [ -z "$DETECTED_PORTS" ]; then
-  # Fallback на grep с правильным паттерном
   DETECTED_PORTS=$(grep -oP '"port"\s*:\s*\K[0-9]+' "$XRAY_CONFIG" 2>/dev/null | sort -nu || true)
 fi
 
@@ -379,7 +363,6 @@ if [ "$USE_F2B" == "y" ]; then
 
   mkdir -p /etc/fail2ban/filter.d
 
-  # Создаём фильтр для Xray
   cat > /etc/fail2ban/filter.d/xray.conf << 'EOF'
 [Definition]
 failregex = ^.*rejected.*from <HOST>.*$
@@ -388,12 +371,10 @@ failregex = ^.*rejected.*from <HOST>.*$
 ignoreregex =
 EOF
 
-  # Определяем путь к логам
   if [ "$INSTALL_TYPE" == "2" ]; then
     if [ -n "$LOG_PATH_HOST" ]; then
       LOG_PATH="$LOG_PATH_HOST"
     else
-      # Создаём временный лог-файл и настраиваем сбор через docker logs
       LOG_PATH="/var/log/xray/access.log"
       mkdir -p "$(dirname "$LOG_PATH")"
       touch "$LOG_PATH"
@@ -408,7 +389,6 @@ EOF
   mkdir -p "$(dirname "$LOG_PATH")"
   touch "$LOG_PATH"
 
-  # Создаём jail конфигурацию
   cat > /etc/fail2ban/jail.d/xray.local << EOF
 [xray]
 enabled = true
@@ -421,7 +401,6 @@ port = ${PORTS//\/both/,:\/tcp,:\/udp}
 action = iptables-multiport[name=xray, port="${PORTS//\/both/,:\/tcp,:\/udp}", protocol=tcp]
 EOF
 
-  # Перезапускаем Fail2Ban
   if systemctl is-active --quiet fail2ban 2>/dev/null; then
     systemctl restart fail2ban
   else
@@ -431,20 +410,12 @@ EOF
   echo "✓ Fail2Ban настроен (лог: $LOG_PATH)"
 fi
 
-### --- ПРИМЕНЕНИЕ ОПТИМИЗАЦИЙ К КОНФИГУ ===
+### --- ПРИМЕНЕНИЕ ОПТИМИЗАЦИЙ К КОНФИГУ ---
 echo "== Оптимизация config.json =="
 
-# Создаём резервную копию
-if [ "$INSTALL_TYPE" == "2" ] && [ -z "$CONFIG_PATH_HOST" ]; then
-  # Для Docker без mount: бэкап во временный файл
-  cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-else
-  cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-fi
+cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
 
-# Применяем оптимизации через jq
 jq '
-  # Добавляем/обновляем настройки транспорта
   .inbounds |= map(
     if .streamSettings then
       .streamSettings.sockopt |= (
@@ -457,12 +428,10 @@ jq '
       .
     end
   ) |
-  # Добавляем глобальные настройки если нет
   .policy = (.policy // {}) |
   .policy.system = (.policy.system // {}) |
   .policy.system.statsOutboundUplink = true |
   .policy.system.statsOutboundDownlink = true |
-  # Оптимизация buffer
   .inbounds |= map(
     .bufferSize = (.bufferSize // 512)
   )
@@ -474,19 +443,16 @@ echo "✓ Конфиг оптимизирован"
 if [ "$INSTALL_TYPE" == "2" ] && [ -z "$CONFIG_PATH_HOST" ] && [ "$XRAY_CONFIG" == "$TEMP_CONFIG" ]; then
   echo "== Возврат конфига в контейнер =="
   
-  # Валидируем перед возвратом
   if ! jq empty "$TEMP_CONFIG" 2>/dev/null; then
     echo "❌ Ошибка валидации конфига после редактирования"
     exit 1
   fi
 
-  # Копируем обратно в контейнер
   if ! docker cp "$TEMP_CONFIG" "$DOCKER_CONTAINER:$CONFIG_PATH_CONTAINER" 2>/dev/null; then
     echo "❌ Не удалось скопировать конфиг обратно в контейнер"
     exit 1
   fi
 
-  # Проверяем, поддерживает ли контейнер hot reload
   if docker exec "$DOCKER_CONTAINER" kill -SIGHUP 1 2>/dev/null; then
     echo "✓ Конфиг применён (SIGHUP)"
   else
@@ -494,11 +460,10 @@ if [ "$INSTALL_TYPE" == "2" ] && [ -z "$CONFIG_PATH_HOST" ] && [ "$XRAY_CONFIG" 
     docker restart "$DOCKER_CONTAINER"
   fi
 
-  # Очищаем временный файл
   rm -f "$TEMP_CONFIG"
 fi
 
-### --- ФИНАЛ ===
+### --- ФИНАЛ ---
 echo ""
 echo "==== Оптимизация завершена ===="
 echo ""
@@ -509,6 +474,7 @@ if [ "$INSTALL_TYPE" == "2" ]; then
   echo "• Для Fail2Ban смонтируйте логи:"
   echo "  -v /путь/к/logs:/var/log/xray"
   echo "• Проверьте работу: docker logs $DOCKER_CONTAINER"
+  echo "• Управление: docker compose up -d (в директории с compose-файлом)"
 else
   echo "• Проверьте статус: systemctl status xray"
   echo "• Логи: journalctl -u xray -f"
